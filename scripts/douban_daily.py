@@ -66,6 +66,8 @@ def configure():
     os.environ["NOTION_TOKEN"] = token
     os.environ["NOTION_MOVIE_URL"] = f"https://www.notion.so/{ROOT_PAGE}"
     os.environ["MOVIE_DATABASE_ID"] = MOVIE_DATABASE
+    # The library reads its environment at import time, before configure().
+    source_api.AUTH_TOKEN = config["account"].get("authToken") or None
     return account
 
 
@@ -185,13 +187,13 @@ def sync_movies(helper, interests):
                 existing[key] = current
         if all_relation:
             properties["全部"] = {"relation": all_relation}
+        helper.get_date_relation(properties, timestamp)
         if current and all(
             same_value(current["properties"].get(name, {}), value)
             for name, value in properties.items()
         ):
             unchanged += 1
             continue
-        helper.get_date_relation(properties, timestamp)
         if current:
             helper.update_page(current["id"], properties)
             updated += 1
@@ -269,7 +271,7 @@ def main():
             for status in STATUS:
                 response = source_api.requests.get(
                     f"https://{source_api.DOUBAN_API_HOST}/api/v2/user/{account}/interests",
-                    headers=source_api._request_headers(False),
+                    headers=source_api._request_headers(True),
                     params={
                         "type": "movie",
                         "status": status,
@@ -279,7 +281,18 @@ def main():
                     },
                     timeout=source_api.DOUBAN_REQUEST_TIMEOUT,
                 )
-                response.raise_for_status()
+                if not response.ok:
+                    print(
+                        json.dumps(
+                            {
+                                "status": status,
+                                "登录接口状态": response.status_code,
+                                "错误码": source_api._response_error_code(response),
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                    continue
                 payload = response.json()
                 print(
                     json.dumps(
