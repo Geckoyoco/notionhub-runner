@@ -8,6 +8,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import pendulum
+from notion_client import Client
 
 from douban2notion.douban import fetch_subjects
 from douban2notion.notion_helper import NotionHelper
@@ -209,6 +210,8 @@ def render_heatmap(interests, year):
 
 def main():
     account = configure()
+    connection = Client(auth=os.environ["NOTION_TOKEN"]).users.me()
+    print(f"使用现有 Notion 连接：{connection.get('name')}")
     helper = MovieTemplate("movie")
     interests = []
     for status in STATUS:
