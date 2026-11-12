@@ -13,6 +13,7 @@ from notion_client import Client
 from douban2notion.douban import fetch_subjects
 from douban2notion.notion_helper import NotionHelper
 from douban2notion import utils
+from watchlists import matching_movies, merge_watchlists
 
 
 ROOT_PAGE = "496eb242c4a083bfa3ce018cff11f615"
@@ -134,9 +135,12 @@ def add_metadata(helper, properties, subject):
 
 def sync_movies(helper, interests):
     existing = {}
+    local_plans = []
     for page in helper.query_all(helper.movie_database_id):
         url = (page["properties"].get("豆瓣") or {}).get("url")
         if not url:
+            if (page["properties"].get("原片单记录") or {}).get("url"):
+                local_plans.append(page)
             continue
         key = subject_key(url)
         if key in existing:
@@ -166,6 +170,16 @@ def sync_movies(helper, interests):
         seen.add(key)
         properties, timestamp = movie_properties(item)
         current = existing.get(key)
+        if not current:
+            matches = matching_movies(
+                local_plans, subject["title"], subject.get("year")
+            )
+            if len(matches) > 1:
+                raise ValueError(f"本地计划电影匹配不唯一：{subject['title']}")
+            if matches:
+                current = matches[0]
+                local_plans.remove(current)
+                existing[key] = current
         if all_relation:
             properties["全部"] = {"relation": all_relation}
         if current and all(
@@ -235,6 +249,11 @@ def main():
     connection = Client(auth=os.environ["NOTION_TOKEN"]).users.me()
     print(f"使用现有 Notion 连接：{connection.get('name')}")
     helper = MovieTemplate("movie")
+    merge_mode = os.getenv("MERGE_WATCHLISTS", "false")
+    if merge_mode in {"preview", "apply"}:
+        merge_watchlists(helper, apply=merge_mode == "apply")
+        if merge_mode == "preview":
+            return
     interests = []
     for status in STATUS:
         interests.extend(fetch_subjects(account, "movie", status))

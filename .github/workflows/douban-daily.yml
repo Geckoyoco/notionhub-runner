@@ -2,6 +2,15 @@ name: 豆瓣每日同步
 
 on:
   workflow_dispatch:
+    inputs:
+      merge_watchlists:
+        description: 原 Movie 片单合并（平时选 false）
+        type: choice
+        default: 'false'
+        options:
+          - 'false'
+          - preview
+          - apply
   schedule:
     - cron: '10 17 * * *'
 
@@ -34,12 +43,15 @@ jobs:
       - name: 同步现有电影模板并生成热力图
         env:
           DOUBAN_FREE_CONFIG: ${{ secrets.DOUBAN_FREE_CONFIG }}
+          MERGE_WATCHLISTS: ${{ inputs.merge_watchlists || 'false' }}
         run: python -u scripts/douban_daily.py
       - uses: actions/upload-pages-artifact@v3
+        if: inputs.merge_watchlists != 'preview'
         with:
           path: site
 
   publish:
+    if: inputs.merge_watchlists != 'preview'
     needs: sync
     runs-on: ubuntu-latest
     permissions:
