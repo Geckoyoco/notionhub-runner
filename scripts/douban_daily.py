@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import time
 from collections import Counter
 from datetime import date, timedelta
 from pathlib import Path
@@ -22,6 +23,7 @@ from watchlists import matching_movies, merge_watchlists, sync_playlist_progress
 ROOT_PAGE = "496eb242c4a083bfa3ce018cff11f615"
 MOVIE_DATABASE = "e19eb242c4a0829f9f6101d5eb286f3f"
 STATUS = {"mark": "想看", "doing": "在看", "done": "看过"}
+LAST_DETAIL_REQUEST = 0.0
 
 
 class MovieTemplate(NotionHelper):
@@ -238,11 +240,14 @@ def fill_poster(helper, page, subject):
 
 @retry(stop_max_attempt_number=3, wait_fixed=5000)
 def public_movie_request(path, **params):
+    global LAST_DETAIL_REQUEST
+    time.sleep(max(0, 8 - (time.monotonic() - LAST_DETAIL_REQUEST)))
+    LAST_DETAIL_REQUEST = time.monotonic()
     response = source_api.requests.get(
         f"https://{source_api.DOUBAN_API_HOST}/api/v2/{path}",
         headers=source_api._request_headers(False),
         params={**params, "apikey": source_api.DOUBAN_API_KEY},
-        timeout=source_api.DOUBAN_REQUEST_TIMEOUT,
+        timeout=(15, 45),
     )
     if not response.ok:
         try:
@@ -250,6 +255,9 @@ def public_movie_request(path, **params):
             print(
                 f"豆瓣详情 HTTP {response.status_code}，code={error.get('code')}，msg={str(error.get('msg', ''))[:120]}"
             )
+            if error.get("code") == 1309:
+                print("豆瓣详情触发限流，等待 60 秒后补试")
+                time.sleep(60)
         except (ValueError, AttributeError):
             pass
     response.raise_for_status()
@@ -332,7 +340,7 @@ def origin_properties(subject):
 
 def sync_origin_metadata(helper):
     pages = helper.query_all(helper.movie_database_id)
-    checked = updated = 0
+    checked = updated = cached = 0
     unavailable = []
     pending = pages
     for attempt in range(2):
@@ -340,6 +348,14 @@ def sync_origin_metadata(helper):
         for page in pending:
             current = page["properties"]
             title = utils.get_property_value(current["电影名"])
+            # Country and language are fixed subject metadata; keep completed
+            # values and fetch only new or incomplete rows on each daily run.
+            if all(
+                current.get(name, {}).get("multi_select")
+                for name in ("制片国家", "语言")
+            ):
+                cached += 1
+                continue
             url = current["豆瓣"].get("url")
             if not url:
                 unavailable.append(title)
@@ -385,6 +401,7 @@ def sync_origin_metadata(helper):
                 "地区语言同步": {
                     "总数": len(saved),
                     "读取豆瓣": checked,
+                    "已补齐保留": cached,
                     "更新": updated,
                     "非空数量": coverage,
                     "缺少豆瓣链接": unavailable,
