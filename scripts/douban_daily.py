@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pendulum
 from notion_client import Client
+from retrying import retry
 
 from douban2notion.douban import fetch_subjects
 from douban2notion import douban as source_api
@@ -136,6 +137,82 @@ def add_metadata(helper, properties, subject):
             properties[name] = utils.get_relation(list(dict.fromkeys(relations))[:100])
 
 
+def poster_url(subject):
+    picture = subject.get("pic") or {}
+    return picture.get("large") or picture.get("normal") or subject.get("cover_url")
+
+
+@retry(stop_max_attempt_number=3, wait_fixed=5000)
+def fill_poster(helper, page, subject):
+    url = poster_url(subject)
+    if not url:
+        return False
+    media = {}
+    if not page.get("cover"):
+        media["cover"] = utils.get_icon(url)
+    if not page.get("icon"):
+        media["icon"] = utils.get_icon(url)
+    if media:
+        saved = helper.client.pages.update(page_id=page["id"], **media)
+        page.update({key: saved[key] for key in media})
+    return "cover" in media
+
+
+def public_movie_request(path, **params):
+    response = source_api.requests.get(
+        f"https://{source_api.DOUBAN_API_HOST}/api/v2/{path}",
+        headers=source_api._request_headers(False),
+        params={**params, "apikey": source_api.DOUBAN_API_KEY},
+        timeout=source_api.DOUBAN_REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def sync_plan_posters(helper):
+    filled = 0
+    unresolved = []
+    for page in helper.query_all(helper.movie_database_id):
+        props = page["properties"]
+        labels = [item["name"] for item in props["片单"]["multi_select"]]
+        if page.get("cover") or not labels:
+            continue
+        url = props["豆瓣"].get("url")
+        title = utils.get_property_value(props["电影名"])
+        year = props["上映年份"].get("number")
+        if url:
+            subject = public_movie_request(f"movie/{subject_key(url)}")
+        else:
+            results = public_movie_request("search/movie", q=title)
+            matches = []
+            for result in results.get("items", []):
+                candidate = result.get("target") or {}
+                if result.get("target_type") != "movie" or not candidate.get("year"):
+                    continue
+                if not matching_movies(
+                    [page], candidate.get("title", ""), candidate["year"]
+                ):
+                    continue
+                if "诺兰" in labels and "克里斯托弗·诺兰" not in candidate.get(
+                    "card_subtitle", ""
+                ):
+                    continue
+                matches.append(candidate)
+            if len(matches) != 1:
+                unresolved.append(title)
+                continue
+            subject = public_movie_request(f"movie/{matches[0]['id']}")
+            if not matching_movies(
+                [page], subject.get("title", ""), subject.get("year")
+            ):
+                raise ValueError(f"封面电影详情不匹配：{title} / {year}")
+            helper.update_page(page["id"], {"豆瓣": {"url": subject["url"]}})
+        filled += int(fill_poster(helper, page, subject))
+    print(
+        f"计划片单封面补齐 {filled} 部，待确认 {len(unresolved)} 部：{', '.join(unresolved)}"
+    )
+
+
 def sync_movies(helper, interests):
     existing = {}
     local_plans = []
@@ -165,7 +242,7 @@ def sync_movies(helper, interests):
             )
         )
         all_relation = [{"id": all_id}]
-    created = updated = unchanged = 0
+    created = updated = unchanged = covers = 0
     seen = set()
     for item in interests:
         subject = item["subject"]
@@ -188,6 +265,8 @@ def sync_movies(helper, interests):
         if all_relation:
             properties["全部"] = {"relation": all_relation}
         helper.get_date_relation(properties, timestamp)
+        if current:
+            covers += int(fill_poster(helper, current, subject))
         if current and all(
             same_value(current["properties"].get(name, {}), value)
             for name, value in properties.items()
@@ -199,15 +278,16 @@ def sync_movies(helper, interests):
             updated += 1
         else:
             add_metadata(helper, properties, subject)
-            cover = (subject.get("pic") or {}).get("normal")
+            cover = poster_url(subject)
             page = helper.create_page(
                 {"database_id": helper.movie_database_id},
                 properties,
                 utils.get_icon(cover) if cover else None,
             )
             existing[key] = page
+            covers += int(fill_poster(helper, page, subject))
             created += 1
-    summary = f"豆瓣电影同步完成，共 {len(seen)} 条，新增 {created}，更新 {updated}，未变化 {unchanged}。"
+    summary = f"豆瓣电影同步完成，共 {len(seen)} 条，新增 {created}，更新 {updated}，未变化 {unchanged}，补齐封面 {covers}。"
     print(summary)
     with open(os.environ.get("GITHUB_STEP_SUMMARY", os.devnull), "a") as file:
         file.write(summary + "\n")
@@ -263,6 +343,7 @@ def main():
     for status in STATUS:
         interests.extend(fetch_subjects(account, "movie", status))
     sync_movies(helper, interests)
+    sync_plan_posters(helper)
     sync_playlist_progress(helper)
     render_heatmap(interests, pendulum.now("Asia/Shanghai").year)
 
