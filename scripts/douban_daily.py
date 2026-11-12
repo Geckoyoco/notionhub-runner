@@ -158,10 +158,11 @@ def fill_poster(helper, page, subject):
     return "cover" in media
 
 
+@retry(stop_max_attempt_number=3, wait_fixed=5000)
 def public_movie_request(path, **params):
     response = source_api.requests.get(
         f"https://{source_api.DOUBAN_API_HOST}/api/v2/{path}",
-        headers=source_api._request_headers(False),
+        headers=source_api._request_headers(True),
         params={**params, "apikey": source_api.DOUBAN_API_KEY},
         timeout=source_api.DOUBAN_REQUEST_TIMEOUT,
     )
