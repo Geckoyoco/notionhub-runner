@@ -31,7 +31,19 @@ class MovieTemplate(NotionHelper):
 
     def update_movie_database(self):
         # This template already has URL-typed IMDb and its own relations.
-        self._get_database_properties(self.movie_database_id)
+        properties = self._get_database_properties(self.movie_database_id)
+        if "语言" not in properties:
+            database = self.client.databases.update(
+                database_id=self.movie_database_id,
+                properties={"语言": {"multi_select": {}}},
+            )
+            self._database_properties_cache[self.movie_database_id] = database[
+                "properties"
+            ]
+        elif properties["语言"].get("type") != "multi_select":
+            raise ValueError("语言字段应为多选，已停止以避免更改现有字段类型")
+        if properties.get("制片国家", {}).get("type") != "multi_select":
+            raise ValueError("制片国家字段应为多选，已停止以避免写错字段")
 
     def get_relation_id(self, name, id, icon, properties=None):
         # Load each small related database once instead of querying every name.
@@ -102,6 +114,10 @@ def same_value(current, expected):
         ) == "".join(x.get("text", {}).get("content", "") for x in target)
     if kind in {"select", "status"}:
         return (value or {}).get("name") == (target or {}).get("name")
+    if kind == "multi_select":
+        return {item["name"] for item in value or []} == {
+            item["name"] for item in target
+        }
     if kind == "date":
         return bool(value) and pendulum.parse(value["start"]) == pendulum.parse(
             target["start"]
@@ -288,6 +304,71 @@ def sync_plan_posters(helper):
     )
 
 
+def origin_properties(subject):
+    properties = {}
+    for target, source in (("制片国家", "countries"), ("语言", "languages")):
+        if source not in subject:
+            continue
+        values = subject[source]
+        if not isinstance(values, list) or any(
+            not isinstance(value, str) for value in values
+        ):
+            raise ValueError(f"豆瓣 {source} 不是字符串列表，已停止以避免错误分类")
+        properties[target] = {
+            "multi_select": [
+                {"name": value} for value in dict.fromkeys(values) if value
+            ]
+        }
+    return properties
+
+
+def sync_origin_metadata(helper):
+    pages = helper.query_all(helper.movie_database_id)
+    checked = updated = 0
+    unavailable = []
+    for page in pages:
+        current = page["properties"]
+        url = current["豆瓣"].get("url")
+        if not url:
+            unavailable.append(utils.get_property_value(current["电影名"]))
+            continue
+        kind = (current["类型"].get("select") or {}).get("name") or "movie"
+        if kind not in {"movie", "tv"}:
+            raise ValueError(f"不支持的豆瓣条目类型：{kind}")
+        subject = public_movie_request(f"{kind}/{subject_key(url)}")
+        properties = origin_properties(subject)
+        changes = {
+            name: value
+            for name, value in properties.items()
+            if not same_value(current.get(name, {}), value)
+        }
+        if changes:
+            helper.update_page(page["id"], changes)
+            updated += 1
+        checked += 1
+        if checked % 25 == 0:
+            print(f"豆瓣地区、语言已核对 {checked} 部")
+    saved = helper.query_all(helper.movie_database_id)
+    coverage = {
+        name: sum(bool(page["properties"][name]["multi_select"]) for page in saved)
+        for name in ("制片国家", "语言")
+    }
+    print(
+        json.dumps(
+            {
+                "地区语言同步": {
+                    "总数": len(saved),
+                    "读取豆瓣": checked,
+                    "更新": updated,
+                    "非空数量": coverage,
+                    "缺少豆瓣链接": unavailable,
+                }
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
 def sync_movies(helper, interests):
     existing = {}
     local_plans = []
@@ -421,6 +502,7 @@ def main():
         interests.extend(fetch_subjects(account, "movie", status))
     sync_movies(helper, interests)
     sync_plan_posters(helper)
+    sync_origin_metadata(helper)
     sync_playlist_progress(helper)
     render_heatmap(interests, pendulum.now("Asia/Shanghai").year)
 
