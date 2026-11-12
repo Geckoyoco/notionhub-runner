@@ -240,7 +240,7 @@ def fill_poster(helper, page, subject):
 def public_movie_request(path, **params):
     response = source_api.requests.get(
         f"https://{source_api.DOUBAN_API_HOST}/api/v2/{path}",
-        headers=source_api._request_headers(True),
+        headers=source_api._request_headers(False),
         params={**params, "apikey": source_api.DOUBAN_API_KEY},
         timeout=source_api.DOUBAN_REQUEST_TIMEOUT,
     )
