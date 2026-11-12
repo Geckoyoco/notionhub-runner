@@ -1,0 +1,237 @@
+# NotionHub generated free workflow v5
+name: 豆瓣免费版
+run-name: ${{ github.workflow }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      notionhub_run_id:
+        description: NotionHub 内部运行标识
+        required: false
+        default: ''
+      reason:
+        description: 触发原因
+        required: false
+        default: manual
+  schedule:
+    - cron: "10 16 * * *"
+
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: notionhub-douban-free-sync-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    name: 同步豆瓣
+    runs-on: ubuntu-latest
+    env:
+      FREE_CONFIG_JSON: ${{ secrets.DOUBAN_FREE_CONFIG }}
+      SOURCE_REPOSITORY: malinkang/douban2notion
+      SOURCE_REF: 9a4fd46e5edd22d5f47d2ef0f31b1e28f569d6e4
+      SOURCE_SHA: 9a4fd46e5edd22d5f47d2ef0f31b1e28f569d6e4
+      REPOSITORY: ${{ github.repository }}
+      ARTIFACT_BRANCH: ${{ github.event.repository.default_branch }}
+      NOTIONHUB_ARTIFACT_ROOT: ${{ github.workspace }}/.notionhub-artifacts/douban
+      NOTIONHUB_ARTIFACT_PATH: .notionhub-artifacts/douban
+    steps:
+      - name: 检查免费版同步授权
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          OIDC_TOKEN=$(curl -fsS --max-time 30 \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https%3A%2F%2Fi.notionhub.app" | jq -er '.value | strings | select(length > 0)')
+          echo "::add-mask::$OIDC_TOKEN"
+          AUTHORIZATION_FILE="$RUNNER_TEMP/notionhub-free-douban-authorization.json"
+          trap 'rm -f "$AUTHORIZATION_FILE"' EXIT
+          if ! curl -fsS --max-time 30 -X POST \
+            "https://i.notionhub.app/v1/github/runner/free/douban/authorize-run" \
+            -H "Authorization: Bearer $OIDC_TOKEN" -H 'Content-Type: application/json' \
+            --data '{}' -o "$AUTHORIZATION_FILE"; then
+            echo "::error title=免费版同步授权失败::账号可能已退出或正在清理，请回到 NotionHub 插件查看连接状态。"
+            exit 1
+          fi
+          if ! jq -e '(.authorized == true) or (.data.authorized == true)' "$AUTHORIZATION_FILE" >/dev/null; then
+            echo "::error title=免费版同步未获授权::请回到 NotionHub 插件查看连接状态。"
+            exit 1
+          fi
+
+      - name: Checkout Runner 仓库
+        uses: actions/checkout@v4
+
+      - name: 检查免费版配置
+        id: config
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$FREE_CONFIG_JSON" ]; then
+            echo "::error title=豆瓣免费版未配置::请先在 NotionHub 插件里保存免费版配置。"
+            exit 1
+          fi
+          CONFIG_FILE="$RUNNER_TEMP/notionhub-free-douban.json"
+          printf '%s' "$FREE_CONFIG_JSON" > "$CONFIG_FILE"
+          chmod 600 "$CONFIG_FILE"
+
+          if ! jq -e '.schemaVersion == 1 and (.notion | type == "object") and (.account | type == "object") and (.options | type == "object")' "$CONFIG_FILE" >/dev/null; then
+            echo "::error title=豆瓣免费版配置无效::请回到 NotionHub 插件重新保存配置。"
+            exit 1
+          fi
+          python3 - "$CONFIG_FILE" <<'PY'
+          import json
+          import sys
+
+          def walk(value):
+              if isinstance(value, dict):
+                  for child in value.values():
+                      yield from walk(child)
+              elif isinstance(value, list):
+                  for child in value:
+                      yield from walk(child)
+              elif isinstance(value, str) and len(value) >= 4:
+                  yield value
+
+          config = json.load(open(sys.argv[1], encoding='utf-8'))
+          for value in walk(config):
+              escaped = value.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+              print(f'::add-mask::{escaped}')
+          PY
+          require_value() {
+            if [ -z "$(jq -r "$1 // empty" "$CONFIG_FILE")" ]; then
+              echo "::error title=豆瓣免费版配置缺失::缺少 $2，请回到插件重新保存。"
+              exit 1
+            fi
+          }
+          require_value '.account.name' '豆瓣用户名'
+          if ! jq -e '(.options.streams // []) | length > 0' "$CONFIG_FILE" >/dev/null; then
+            echo "::error title=豆瓣免费版同步内容缺失::请至少选择电影或图书。"
+            exit 1
+          fi
+          if jq -e '(.options.streams // []) | index("movie") != null' "$CONFIG_FILE" >/dev/null; then
+            require_value '.notion.targets.movie.token' '豆瓣电影 Notion token'
+            require_value '.notion.targets.movie.pages.root' '豆瓣电影模板'
+            require_value '.notion.targets.movie.pages.databaseId' '豆瓣电影数据库'
+          fi
+          if jq -e '(.options.streams // []) | index("book") != null' "$CONFIG_FILE" >/dev/null; then
+            require_value '.notion.targets.book.token' '豆瓣图书 Notion token'
+            require_value '.notion.targets.book.pages.root' '豆瓣图书模板'
+            require_value '.notion.targets.book.pages.databaseId' '豆瓣图书数据库'
+          fi
+          echo "FREE_CONFIG_FILE=$CONFIG_FILE" >> "$GITHUB_ENV"
+          echo "movie=$(jq -r '(.options.streams // []) | index("movie") != null' "$CONFIG_FILE")" >> "$GITHUB_OUTPUT"
+          echo "book=$(jq -r '(.options.streams // []) | index("book") != null' "$CONFIG_FILE")" >> "$GITHUB_OUTPUT"
+          echo "heatmap=$(jq -r '.options.heatmap // true' "$CONFIG_FILE")" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout 固定开源版本
+        uses: actions/checkout@v4
+        with:
+          repository: malinkang/douban2notion
+          ref: 9a4fd46e5edd22d5f47d2ef0f31b1e28f569d6e4
+          path: .notionhub-source/douban
+          persist-credentials: false
+
+      - name: 校验开源版本
+        working-directory: .notionhub-source/douban
+        run: |
+          ACTUAL_SHA=$(git rev-parse HEAD)
+          if [ "$ACTUAL_SHA" != "$SOURCE_SHA" ]; then
+            echo "::error title=开源版本校验失败::malinkang/douban2notion@9a4fd46e5edd22d5f47d2ef0f31b1e28f569d6e4 的提交与预期 SHA 不一致。"
+            exit 1
+          fi
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装开源同步程序
+        working-directory: .notionhub-source/douban
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install .
+
+      - name: 同步豆瓣电影
+        if: steps.config.outputs.movie == 'true'
+        working-directory: .notionhub-source/douban
+        run: |
+          export NOTION_TOKEN="$(jq -r '.notion.targets.movie.token' "$FREE_CONFIG_FILE")"
+          export NOTION_MOVIE_URL="$(jq -r '.notion.targets.movie.pages.root' "$FREE_CONFIG_FILE")"
+          export MOVIE_DATABASE_ID="$(jq -r '.notion.targets.movie.pages.databaseId' "$FREE_CONFIG_FILE")"
+          export DOUBAN_NAME="$(jq -r '.account.name' "$FREE_CONFIG_FILE")"
+          export AUTH_TOKEN="$(jq -r '.account.authToken // ""' "$FREE_CONFIG_FILE")"
+          douban movie
+
+      - name: 生成豆瓣电影热力图
+        if: steps.config.outputs.movie == 'true' && steps.config.outputs.heatmap == 'true'
+        working-directory: .notionhub-source/douban
+        run: |
+          export NOTION_TOKEN="$(jq -r '.notion.targets.movie.token' "$FREE_CONFIG_FILE")"
+          export NOTION_MOVIE_URL="$(jq -r '.notion.targets.movie.pages.root' "$FREE_CONFIG_FILE")"
+          export DATABASE_ID="$(jq -r '.notion.targets.movie.pages.databaseId' "$FREE_CONFIG_FILE")"
+          export MOVIE_DATABASE_ID="$DATABASE_ID"
+          NAME="$(jq -r '.account.name' "$FREE_CONFIG_FILE")"
+          douban_heatmap notion --notion_token "$NOTION_TOKEN" --database_id "$DATABASE_ID" --date_prop_name "日期" --value_prop_name "看过" --unit "部" --year "$(date +%Y)" --me "$NAME" --without-type-name
+          heatmap movie
+
+      - name: 同步豆瓣图书
+        if: steps.config.outputs.book == 'true'
+        working-directory: .notionhub-source/douban
+        run: |
+          export NOTION_TOKEN="$(jq -r '.notion.targets.book.token' "$FREE_CONFIG_FILE")"
+          export NOTION_BOOK_URL="$(jq -r '.notion.targets.book.pages.root' "$FREE_CONFIG_FILE")"
+          export BOOK_DATABASE_ID="$(jq -r '.notion.targets.book.pages.databaseId' "$FREE_CONFIG_FILE")"
+          export DOUBAN_NAME="$(jq -r '.account.name' "$FREE_CONFIG_FILE")"
+          export AUTH_TOKEN="$(jq -r '.account.authToken // ""' "$FREE_CONFIG_FILE")"
+          douban book
+
+      - name: 生成豆瓣图书热力图
+        if: steps.config.outputs.book == 'true' && steps.config.outputs.heatmap == 'true'
+        working-directory: .notionhub-source/douban
+        run: |
+          export NOTION_TOKEN="$(jq -r '.notion.targets.book.token' "$FREE_CONFIG_FILE")"
+          export NOTION_BOOK_URL="$(jq -r '.notion.targets.book.pages.root' "$FREE_CONFIG_FILE")"
+          export DATABASE_ID="$(jq -r '.notion.targets.book.pages.databaseId' "$FREE_CONFIG_FILE")"
+          export BOOK_DATABASE_ID="$DATABASE_ID"
+          NAME="$(jq -r '.account.name' "$FREE_CONFIG_FILE")"
+          douban_heatmap notion --notion_token "$NOTION_TOKEN" --database_id "$DATABASE_ID" --date_prop_name "日期" --value_prop_name "读过" --unit "本" --year "$(date +%Y)" --me "$NAME" --without-type-name
+          heatmap book
+      - name: 保存公开热力图
+        if: steps.config.outputs.heatmap == 'true' && (steps.config.outputs.movie == 'true' || steps.config.outputs.book == 'true')
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -d ".notionhub-artifacts/douban" ] || ! find ".notionhub-artifacts/douban" -type f -name '*.svg' -print -quit | grep -q .; then
+            echo "未生成热力图文件，跳过提交。"
+            exit 0
+          fi
+          if find ".notionhub-artifacts/douban" -type f ! -name '*.svg' -print -quit | grep -q .; then
+            echo "::error title=热力图产物无效::产物目录包含非 SVG 文件。"
+            exit 1
+          fi
+          while IFS= read -r file; do
+            if [ "$(wc -c < "$file")" -gt 1048576 ]; then
+              echo "::error title=热力图产物过大::$file 超过 1 MB。"
+              exit 1
+            fi
+          done < <(find ".notionhub-artifacts/douban" -type f -name '*.svg')
+          git config user.email "action@github.com"
+          git config user.name "NotionHub Action"
+          git add -- ".notionhub-artifacts/douban"
+          if git diff --cached --quiet; then
+            echo "热力图没有变化。"
+            exit 0
+          fi
+          git commit -m "chore: update douban heatmap"
+          BRANCH="$ARTIFACT_BRANCH"
+          for attempt in 1 2 3; do
+            git pull --rebase origin "$BRANCH"
+            if git push origin "HEAD:$BRANCH"; then exit 0; fi
+            [ "$attempt" = "3" ] && exit 1
+            sleep $((attempt * 2))
+          done
