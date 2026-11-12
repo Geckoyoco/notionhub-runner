@@ -177,3 +177,47 @@ def merge_watchlists(helper, apply):
         if row["watched"] and values["状态"]["status"]["name"] != "看过":
             raise ValueError(f"合并后已看状态丢失：{row['title']}")
     print(f"片单合并验证通过：{len(plan)} 条，原清单与原进度关联均已保留。")
+
+
+def sync_playlist_progress(helper):
+    groups = {}
+    for page in helper.query_all(helper.movie_database_id):
+        properties = page["properties"]
+        phase = (properties.get("阶段") or {}).get("select")
+        for tag in (properties.get("片单") or {}).get("multi_select", []):
+            scope = tag["name"]
+            if scope == "漫威" and phase:
+                scope = phase["name"].split("：")[0]
+            groups.setdefault(scope, []).append(page["id"])
+    rows = helper.query_all(PROGRESS_DATABASE)
+    existing = {
+        utils.get_property_value(row["properties"]["范围"]): row for row in rows
+    }
+    order = max(
+        (row["properties"]["阶段顺序"].get("number") or 0 for row in rows), default=0
+    )
+    for scope, row in existing.items():
+        if scope not in groups and row["properties"]["统一电影清单"]["relation"]:
+            helper.client.pages.update(
+                page_id=row["id"], properties={"统一电影清单": {"relation": []}}
+            )
+    for scope, movie_ids in groups.items():
+        if len(movie_ids) > 100:
+            raise ValueError(f"片单 {scope} 超过单次关联上限，需要拆分进度分组")
+        properties = {"统一电影清单": utils.get_relation(movie_ids)}
+        row = existing.get(scope)
+        if row:
+            previous_ids = {
+                value["id"] for value in row["properties"]["统一电影清单"]["relation"]
+            }
+            if previous_ids != set(movie_ids):
+                helper.client.pages.update(page_id=row["id"], properties=properties)
+        else:
+            order += 1
+            properties.update(
+                {"范围": utils.get_title(scope), "阶段顺序": {"number": order}}
+            )
+            helper.client.pages.create(
+                parent={"database_id": PROGRESS_DATABASE}, properties=properties
+            )
+    print(f"片单进度关联已核对：{len(groups)} 组。")

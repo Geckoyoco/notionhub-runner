@@ -13,7 +13,7 @@ from notion_client import Client
 from douban2notion.douban import fetch_subjects
 from douban2notion.notion_helper import NotionHelper
 from douban2notion import utils
-from watchlists import matching_movies, merge_watchlists
+from watchlists import matching_movies, merge_watchlists, sync_playlist_progress
 
 
 ROOT_PAGE = "496eb242c4a083bfa3ce018cff11f615"
@@ -139,7 +139,9 @@ def sync_movies(helper, interests):
     for page in helper.query_all(helper.movie_database_id):
         url = (page["properties"].get("豆瓣") or {}).get("url")
         if not url:
-            if (page["properties"].get("原片单记录") or {}).get("url"):
+            if (page["properties"].get("原片单记录") or {}).get("url") or (
+                page["properties"].get("片单") or {}
+            ).get("multi_select"):
                 local_plans.append(page)
             continue
         key = subject_key(url)
@@ -258,6 +260,7 @@ def main():
     for status in STATUS:
         interests.extend(fetch_subjects(account, "movie", status))
     sync_movies(helper, interests)
+    sync_playlist_progress(helper)
     render_heatmap(interests, pendulum.now("Asia/Shanghai").year)
 
 
