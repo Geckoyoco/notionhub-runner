@@ -244,6 +244,14 @@ def public_movie_request(path, **params):
         params={**params, "apikey": source_api.DOUBAN_API_KEY},
         timeout=source_api.DOUBAN_REQUEST_TIMEOUT,
     )
+    if not response.ok:
+        try:
+            error = response.json()
+            print(
+                f"豆瓣详情 HTTP {response.status_code}，code={error.get('code')}，msg={str(error.get('msg', ''))[:120]}"
+            )
+        except (ValueError, AttributeError):
+            pass
     response.raise_for_status()
     return response.json()
 
@@ -326,28 +334,46 @@ def sync_origin_metadata(helper):
     pages = helper.query_all(helper.movie_database_id)
     checked = updated = 0
     unavailable = []
-    for page in pages:
-        current = page["properties"]
-        url = current["豆瓣"].get("url")
-        if not url:
-            unavailable.append(utils.get_property_value(current["电影名"]))
-            continue
-        kind = (current["类型"].get("select") or {}).get("name") or "movie"
-        if kind not in {"movie", "tv"}:
-            raise ValueError(f"不支持的豆瓣条目类型：{kind}")
-        subject = public_movie_request(f"{kind}/{subject_key(url)}")
-        properties = origin_properties(subject)
-        changes = {
-            name: value
-            for name, value in properties.items()
-            if not same_value(current.get(name, {}), value)
-        }
-        if changes:
-            helper.update_page(page["id"], changes)
-            updated += 1
-        checked += 1
-        if checked % 25 == 0:
-            print(f"豆瓣地区、语言已核对 {checked} 部")
+    pending = pages
+    for attempt in range(2):
+        failed = []
+        for page in pending:
+            current = page["properties"]
+            title = utils.get_property_value(current["电影名"])
+            url = current["豆瓣"].get("url")
+            if not url:
+                unavailable.append(title)
+                continue
+            kind = (current["类型"].get("select") or {}).get("name") or "movie"
+            if kind not in {"movie", "tv"}:
+                raise ValueError(f"不支持的豆瓣条目类型：{kind}")
+            try:
+                subject = public_movie_request(f"{kind}/{subject_key(url)}")
+            except source_api.requests.RequestException as exc:
+                failed.append(page)
+                print(f"豆瓣详情暂缓：{title}，{type(exc).__name__}")
+                continue
+            properties = origin_properties(subject)
+            changes = {
+                name: value
+                for name, value in properties.items()
+                if not same_value(current.get(name, {}), value)
+            }
+            if changes:
+                helper.update_page(page["id"], changes)
+                updated += 1
+            checked += 1
+            if checked % 25 == 0:
+                print(f"豆瓣地区、语言已核对 {checked} 部")
+        pending = failed
+        if not pending:
+            break
+        print(f"豆瓣地区、语言第 {attempt + 1} 轮剩余 {len(pending)} 部，继续补试")
+    if pending:
+        titles = [
+            utils.get_property_value(page["properties"]["电影名"]) for page in pending
+        ]
+        raise RuntimeError(f"豆瓣地区、语言仍有 {len(pending)} 部未成功读取：{titles}")
     saved = helper.query_all(helper.movie_database_id)
     coverage = {
         name: sum(bool(page["properties"][name]["multi_select"]) for page in saved)
