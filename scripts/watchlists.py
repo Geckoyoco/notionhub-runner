@@ -10,6 +10,12 @@ PROGRESS_DATABASE = "97f083001bbb4f0b9a16d5b5d9f34946"
 PLAYLISTS = {"Marvel": "漫威", "Nolan": "诺兰"}
 
 
+def progress_scope(name):
+    if name == "Nolan":
+        return "诺兰"
+    return name.removeprefix("Marvel_")
+
+
 def film_title(title):
     return re.sub(r"[（(]\d{4}[）)]$", "", title).strip()
 
@@ -156,10 +162,19 @@ def merge_watchlists(helper, apply):
                 {"database_id": helper.movie_database_id}, properties, None
             )
         mapping[row["source"]["id"]] = target["id"]
+    original_scopes = {
+        progress_scope(utils.get_property_value(row["properties"]["范围"]))
+        for row in progress
+        if row["properties"]["电影清单"]["relation"]
+    }
     for row in progress:
-        target_ids = [
-            mapping[value["id"]] for value in row["properties"]["电影清单"]["relation"]
-        ]
+        source_relations = row["properties"]["电影清单"]["relation"]
+        if not source_relations:
+            scope = progress_scope(utils.get_property_value(row["properties"]["范围"]))
+            if scope in original_scopes:
+                helper.client.pages.update(page_id=row["id"], archived=True)
+            continue
+        target_ids = [mapping[value["id"]] for value in source_relations]
         helper.client.pages.update(
             page_id=row["id"],
             properties={"统一电影清单": utils.get_relation(target_ids)},
@@ -190,9 +205,12 @@ def sync_playlist_progress(helper):
                 scope = phase["name"].split("：")[0]
             groups.setdefault(scope, []).append(page["id"])
     rows = helper.query_all(PROGRESS_DATABASE)
-    existing = {
-        utils.get_property_value(row["properties"]["范围"]): row for row in rows
-    }
+    existing = {}
+    for row in rows:
+        scope = progress_scope(utils.get_property_value(row["properties"]["范围"]))
+        if scope in existing:
+            raise ValueError(f"进度分组名称重复：{scope}")
+        existing[scope] = row
     order = max(
         (row["properties"]["阶段顺序"].get("number") or 0 for row in rows), default=0
     )
