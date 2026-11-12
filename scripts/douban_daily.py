@@ -212,6 +212,11 @@ def sync_plan_posters(helper):
     print(
         f"计划片单封面补齐 {filled} 部，待确认 {len(unresolved)} 部：{', '.join(unresolved)}"
     )
+    pages = helper.query_all(helper.movie_database_id)
+    missing = sum(not page.get("cover") for page in pages)
+    print(
+        f"电影封面核验：共 {len(pages)} 部，有封面 {len(pages) - missing} 部，缺少 {missing} 部。"
+    )
 
 
 def sync_movies(helper, interests):
