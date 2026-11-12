@@ -1,0 +1,54 @@
+name: 豆瓣每日同步
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '10 17 * * *'
+
+concurrency:
+  group: douban-daily
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: malinkang/douban2notion
+          ref: 9a4fd46e5edd22d5f47d2ef0f31b1e28f569d6e4
+          path: .source/douban
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 安装公开同步程序
+        run: |
+          pip install --quiet -r .source/douban/requirements.txt
+          pip install --quiet .source/douban
+      - name: 同步现有电影模板并生成热力图
+        env:
+          DOUBAN_FREE_CONFIG: ${{ secrets.DOUBAN_FREE_CONFIG }}
+        run: python -u scripts/douban_daily.py
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  publish:
+    needs: sync
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 发布豆瓣热力图
+        id: deployment
+        uses: actions/deploy-pages@v4
