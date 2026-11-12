@@ -11,6 +11,7 @@ import pendulum
 from notion_client import Client
 
 from douban2notion.douban import fetch_subjects
+from douban2notion import douban as source_api
 from douban2notion.notion_helper import NotionHelper
 from douban2notion import utils
 from watchlists import matching_movies, merge_watchlists, sync_playlist_progress
@@ -255,6 +256,66 @@ def main():
     if merge_mode in {"preview", "apply"}:
         merge_watchlists(helper, apply=merge_mode == "apply")
         if merge_mode == "preview":
+            config = json.loads(os.environ["DOUBAN_FREE_CONFIG"])
+            print(
+                json.dumps(
+                    {
+                        "豆瓣账号": account,
+                        "存在登录凭据": bool(config["account"].get("authToken")),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            for status in STATUS:
+                response = source_api.requests.get(
+                    f"https://{source_api.DOUBAN_API_HOST}/api/v2/user/{account}/interests",
+                    headers=source_api._request_headers(False),
+                    params={
+                        "type": "movie",
+                        "status": status,
+                        "count": 50,
+                        "start": 0,
+                        "apikey": source_api.DOUBAN_API_KEY,
+                    },
+                    timeout=source_api.DOUBAN_REQUEST_TIMEOUT,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                print(
+                    json.dumps(
+                        {
+                            "status": status,
+                            "keys": list(payload),
+                            "metadata": {
+                                key: payload.get(key)
+                                for key in (
+                                    "total",
+                                    "count",
+                                    "start",
+                                    "has_more",
+                                    "next_start",
+                                )
+                            },
+                            "本页": len(payload.get("interests", [])),
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            for page in helper.query_all(helper.movie_database_id):
+                title = utils.get_property_value(page["properties"]["电影名"])
+                if "蝙蝠侠" in title or "盗梦" in title:
+                    print(
+                        json.dumps(
+                            {
+                                "电影": title,
+                                "id": page["id"],
+                                "日期": page["properties"]["日期"].get("date"),
+                                "年": page["properties"]["年"].get("relation"),
+                                "豆瓣": page["properties"]["豆瓣"].get("url"),
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
             return
     interests = []
     for status in STATUS:
