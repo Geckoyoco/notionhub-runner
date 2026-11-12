@@ -21,9 +21,31 @@ STATUS = {"mark": "想看", "doing": "在看", "done": "看过"}
 
 
 class MovieTemplate(NotionHelper):
+    def __init__(self, type):
+        self.relation_ids = {}
+        super().__init__(type)
+
     def update_movie_database(self):
         # This template already has URL-typed IMDb and its own relations.
         self._get_database_properties(self.movie_database_id)
+
+    def get_relation_id(self, name, id, icon, properties=None):
+        # Load each small related database once instead of querying every name.
+        if id not in self.relation_ids:
+            self.relation_ids[id] = {
+                utils.get_property_value(page["properties"]["标题"]): page["id"]
+                for page in self.query_all(id)
+            }
+        if name not in self.relation_ids[id]:
+            values = dict(properties or {})
+            values["标题"] = utils.get_title(name)
+            page = self.client.pages.create(
+                parent={"database_id": id},
+                properties=values,
+                icon=utils.get_icon(icon),
+            )
+            self.relation_ids[id][name] = page["id"]
+        return self.relation_ids[id][name]
 
 
 def subject_key(url):
