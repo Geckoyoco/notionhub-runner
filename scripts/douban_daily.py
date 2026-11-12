@@ -6,6 +6,7 @@ import re
 from collections import Counter
 from datetime import date, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pendulum
 from notion_client import Client
@@ -142,17 +143,78 @@ def poster_url(subject):
     return picture.get("large") or picture.get("normal") or subject.get("cover_url")
 
 
+def needs_stored_poster(value):
+    if not value:
+        return True
+    url = (value.get("external") or {}).get("url", "")
+    return urlparse(url).hostname is not None and urlparse(url).hostname.endswith(
+        ".doubanio.com"
+    )
+
+
+def upload_poster(helper, url):
+    cache = helper.__dict__.setdefault("poster_uploads", {})
+    if url in cache:
+        return cache[url]
+    image = source_api.requests.get(
+        url,
+        headers={
+            "Referer": "https://movie.douban.com/",
+            "User-Agent": source_api.headers["user-agent"],
+        },
+        timeout=source_api.DOUBAN_REQUEST_TIMEOUT,
+    )
+    image.raise_for_status()
+    content_type = image.headers.get("Content-Type", "").split(";")[0]
+    if not content_type.startswith("image/") or not image.content:
+        raise ValueError("豆瓣海报响应不是有效图片")
+    headers = {
+        "Authorization": f"Bearer {os.environ['NOTION_TOKEN']}",
+        "Notion-Version": "2026-03-11",
+    }
+    filename = "poster." + {
+        "image/jpeg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp",
+    }.get(content_type, "jpg")
+    upload = source_api.requests.post(
+        "https://api.notion.com/v1/file_uploads",
+        headers=headers,
+        json={
+            "mode": "single_part",
+            "filename": filename,
+            "content_type": content_type,
+        },
+        timeout=(10, 60),
+    )
+    upload.raise_for_status()
+    upload_id = upload.json()["id"]
+    sent = source_api.requests.post(
+        f"https://api.notion.com/v1/file_uploads/{upload_id}/send",
+        headers=headers,
+        files={"file": (filename, image.content, content_type)},
+        timeout=(10, 60),
+    )
+    sent.raise_for_status()
+    if sent.json().get("status") != "uploaded":
+        raise ValueError("Notion 海报上传尚未完成")
+    cache[url] = {"type": "file_upload", "file_upload": {"id": upload_id}}
+    return cache[url]
+
+
 @retry(stop_max_attempt_number=3, wait_fixed=5000)
 def fill_poster(helper, page, subject):
     url = poster_url(subject)
     if not url:
         return False
     media = {}
-    if not page.get("cover"):
-        media["cover"] = utils.get_icon(url)
-    if not page.get("icon"):
-        media["icon"] = utils.get_icon(url)
+    if needs_stored_poster(page.get("cover")):
+        media["cover"] = None
+    if needs_stored_poster(page.get("icon")):
+        media["icon"] = None
     if media:
+        stored = upload_poster(helper, url)
+        media = {key: stored for key in media}
         saved = helper.client.pages.update(page_id=page["id"], **media)
         page.update({key: saved[key] for key in media})
     return "cover" in media
@@ -176,7 +238,7 @@ def sync_plan_posters(helper):
     for page in helper.query_all(helper.movie_database_id):
         props = page["properties"]
         labels = [item["name"] for item in props["片单"]["multi_select"]]
-        if page.get("cover") or not labels:
+        if not needs_stored_poster(page.get("cover")) or not labels:
             continue
         url = props["豆瓣"].get("url")
         title = utils.get_property_value(props["电影名"])
@@ -199,6 +261,13 @@ def sync_plan_posters(helper):
                 ):
                     continue
                 matches.append(candidate)
+            exact = [
+                candidate
+                for candidate in matches
+                if re.sub(r"\W", "", candidate["title"]) == re.sub(r"\W", "", title)
+            ]
+            if exact:
+                matches = exact
             if len(matches) != 1:
                 unresolved.append(title)
                 continue
@@ -213,7 +282,7 @@ def sync_plan_posters(helper):
         f"计划片单封面补齐 {filled} 部，待确认 {len(unresolved)} 部：{', '.join(unresolved)}"
     )
     pages = helper.query_all(helper.movie_database_id)
-    missing = sum(not page.get("cover") for page in pages)
+    missing = sum(needs_stored_poster(page.get("cover")) for page in pages)
     print(
         f"电影封面核验：共 {len(pages)} 部，有封面 {len(pages) - missing} 部，缺少 {missing} 部。"
     )
@@ -273,6 +342,8 @@ def sync_movies(helper, interests):
         helper.get_date_relation(properties, timestamp)
         if current:
             covers += int(fill_poster(helper, current, subject))
+            if covers and covers % 25 == 0:
+                print(f"海报已保存到 Notion：{covers} 部")
         if current and all(
             same_value(current["properties"].get(name, {}), value)
             for name, value in properties.items()
