@@ -356,6 +356,31 @@ def origin_properties(subject):
     return properties
 
 
+def director_audit(pages):
+    missing = [
+        utils.get_property_value(page["properties"]["电影名"])
+        for page in pages
+        if not page["properties"].get("导演", {}).get("relation")
+    ]
+    marvel = [
+        page
+        for page in pages
+        if any(
+            item["name"] == "漫威"
+            for item in page["properties"].get("片单", {}).get("multi_select", [])
+        )
+    ]
+    return {
+        "总数": len(pages),
+        "有导演": len(pages) - len(missing),
+        "缺导演": missing,
+        "漫威总数": len(marvel),
+        "漫威有导演": sum(
+            bool(page["properties"].get("导演", {}).get("relation")) for page in marvel
+        ),
+    }
+
+
 def sync_origin_metadata(helper):
     pages = helper.query_all(helper.movie_database_id)
     checked = updated = cached = 0
@@ -428,7 +453,8 @@ def sync_origin_metadata(helper):
                     "更新": updated,
                     "非空数量": coverage,
                     "缺少豆瓣链接": unavailable,
-                }
+                },
+                "导演核验": director_audit(saved),
             },
             ensure_ascii=False,
         )
@@ -438,7 +464,9 @@ def sync_origin_metadata(helper):
 def sync_movies(helper, interests):
     existing = {}
     local_plans = []
-    for page in helper.query_all(helper.movie_database_id):
+    pages = helper.query_all(helper.movie_database_id)
+    print(json.dumps({"导演补齐前": director_audit(pages)}, ensure_ascii=False))
+    for page in pages:
         url = (page["properties"].get("豆瓣") or {}).get("url")
         if not url:
             if (page["properties"].get("原片单记录") or {}).get("url") or (
