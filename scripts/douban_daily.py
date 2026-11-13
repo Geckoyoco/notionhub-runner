@@ -127,6 +127,24 @@ def same_value(current, expected):
     return value == target
 
 
+def add_director_metadata(helper, properties, subject):
+    if not helper.director_database_id:
+        return
+    relations = []
+    for value in subject.get("directors") or []:
+        name = value.get("name") if isinstance(value, dict) else value
+        if name:
+            relations.append(
+                helper.get_relation_id(
+                    name,
+                    helper.director_database_id,
+                    "https://www.notion.so/icons/user-circle_gray.svg",
+                )
+            )
+    if relations:
+        properties["导演"] = utils.get_relation(list(dict.fromkeys(relations))[:100])
+
+
 def add_metadata(helper, properties, subject):
     if subject.get("type") in {"movie", "tv"}:
         properties["类型"] = {"select": {"name": subject["type"]}}
@@ -138,7 +156,6 @@ def add_metadata(helper, properties, subject):
         properties["豆瓣评分"] = {"number": score}
     for name, source, database_id in (
         ("分类", "genres", helper.category_database_id),
-        ("导演", "directors", helper.director_database_id),
         ("演员", "actors", helper.actor_database_id),
     ):
         relations = []
@@ -154,6 +171,7 @@ def add_metadata(helper, properties, subject):
                 )
         if relations:
             properties[name] = utils.get_relation(list(dict.fromkeys(relations))[:100])
+    add_director_metadata(helper, properties, subject)
 
 
 def poster_url(subject):
@@ -348,12 +366,12 @@ def sync_origin_metadata(helper):
         for page in pending:
             current = page["properties"]
             title = utils.get_property_value(current["电影名"])
-            # Country and language are fixed subject metadata; keep completed
-            # values and fetch only new or incomplete rows on each daily run.
+            # Reuse complete subject metadata; merged plans may still need
+            # director relations even after country/language were populated.
             if all(
                 current.get(name, {}).get("multi_select")
                 for name in ("制片国家", "语言")
-            ):
+            ) and current.get("导演", {}).get("relation"):
                 cached += 1
                 continue
             url = current["豆瓣"].get("url")
@@ -370,6 +388,8 @@ def sync_origin_metadata(helper):
                 print(f"豆瓣详情暂缓：{title}，{type(exc).__name__}")
                 continue
             properties = origin_properties(subject)
+            if not current.get("导演", {}).get("relation"):
+                add_director_metadata(helper, properties, subject)
             changes = {
                 name: value
                 for name, value in properties.items()
@@ -395,6 +415,9 @@ def sync_origin_metadata(helper):
         name: sum(bool(page["properties"][name]["multi_select"]) for page in saved)
         for name in ("制片国家", "语言")
     }
+    coverage["导演"] = sum(
+        bool(page["properties"].get("导演", {}).get("relation")) for page in saved
+    )
     print(
         json.dumps(
             {
@@ -468,6 +491,8 @@ def sync_movies(helper, interests):
             covers += int(fill_poster(helper, current, subject))
             if covers and covers % 25 == 0:
                 print(f"海报已保存到 Notion：{covers} 部")
+            if not current["properties"].get("导演", {}).get("relation"):
+                add_director_metadata(helper, properties, subject)
         if current and all(
             same_value(current["properties"].get(name, {}), value)
             for name, value in properties.items()
