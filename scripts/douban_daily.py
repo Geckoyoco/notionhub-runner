@@ -24,6 +24,7 @@ ROOT_PAGE = "496eb242c4a083bfa3ce018cff11f615"
 MOVIE_DATABASE = "e19eb242c4a0829f9f6101d5eb286f3f"
 STATUS = {"mark": "想看", "doing": "在看", "done": "看过"}
 LAST_DETAIL_REQUEST = 0.0
+CELEBRITY_INTERVAL = 2.0
 
 
 class MovieTemplate(NotionHelper):
@@ -258,8 +259,9 @@ def fill_poster(helper, page, subject):
 
 @retry(stop_max_attempt_number=3, wait_fixed=5000)
 def public_movie_request(path, **params):
-    global LAST_DETAIL_REQUEST
-    time.sleep(max(0, 8 - (time.monotonic() - LAST_DETAIL_REQUEST)))
+    global LAST_DETAIL_REQUEST, CELEBRITY_INTERVAL
+    interval = CELEBRITY_INTERVAL if path.endswith("/celebrities") else 8
+    time.sleep(max(0, interval - (time.monotonic() - LAST_DETAIL_REQUEST)))
     LAST_DETAIL_REQUEST = time.monotonic()
     response = source_api.requests.get(
         f"https://{source_api.DOUBAN_API_HOST}/api/v2/{path}",
@@ -274,6 +276,7 @@ def public_movie_request(path, **params):
                 f"豆瓣详情 HTTP {response.status_code}，code={error.get('code')}，msg={str(error.get('msg', ''))[:120]}"
             )
             if error.get("code") == 1309:
+                CELEBRITY_INTERVAL = 8.0
                 print("豆瓣详情触发限流，等待 60 秒后补试")
                 time.sleep(60)
         except (ValueError, AttributeError):
@@ -547,6 +550,112 @@ def sync_movies(helper, interests):
         file.write(summary + "\n")
 
 
+def needs_director_portrait(icon):
+    if not icon:
+        return True
+    if icon.get("type") == "icon":
+        return (icon.get("icon") or {}).get("name") == "user-circle"
+    url = (icon.get("external") or {}).get("url", "")
+    return needs_stored_poster(icon) or bool(
+        url
+        and urlparse(url).hostname in {"www.notion.so", "notion.so"}
+        and urlparse(url).path.startswith("/icons/user-circle_")
+    )
+
+
+@retry(stop_max_attempt_number=3, wait_fixed=5000)
+def fill_director_portrait(helper, page, person):
+    avatar = person.get("avatar") or {}
+    url = avatar.get("large") or avatar.get("normal")
+    if not url or "/pics/celebrity-default" in url:
+        return False
+    stored = upload_poster(helper, url)
+    saved = helper.client.pages.update(page_id=page["id"], icon=stored)
+    page["icon"] = saved.get("icon", stored)
+    return True
+
+
+def sync_director_portraits(helper):
+    movies = helper.query_all(helper.movie_database_id)
+    directors = {
+        page["id"]: page for page in helper.query_all(helper.director_database_id)
+    }
+    active = {
+        relation["id"]
+        for page in movies
+        for relation in page["properties"].get("导演", {}).get("relation", [])
+    }
+    missing = {
+        id
+        for id in active
+        if id in directors and needs_director_portrait(directors[id].get("icon"))
+    }
+    unknown = active - directors.keys()
+    if unknown:
+        raise ValueError(f"电影关联的导演记录未读取完整：{len(unknown)} 条")
+    print(f"导演头像待补齐：{len(missing)} / {len(active)} 位")
+    filled = 0
+    for attempt in range(2):
+        for movie in movies:
+            props = movie["properties"]
+            needed = {
+                relation["id"] for relation in props.get("导演", {}).get("relation", [])
+            } & missing
+            url = (props.get("豆瓣") or {}).get("url")
+            if not needed or not url:
+                continue
+            kind = (props.get("类型", {}).get("select") or {}).get("name") or "movie"
+            try:
+                credits = public_movie_request(f"{kind}/{subject_key(url)}/celebrities")
+            except source_api.requests.RequestException as exc:
+                print(
+                    f"导演头像资料暂缓：{utils.get_property_value(props['电影名'])}，{type(exc).__name__}"
+                )
+                continue
+            for id in needed:
+                page = directors[id]
+                name = utils.get_property_value(page["properties"]["标题"])
+                matches = [
+                    person
+                    for person in credits.get("directors", [])
+                    if person.get("name") == name
+                ]
+                if len(matches) != 1:
+                    continue
+                try:
+                    completed = fill_director_portrait(helper, page, matches[0])
+                except source_api.requests.RequestException as exc:
+                    print(f"导演头像保存暂缓：{name}，{type(exc).__name__}")
+                    continue
+                if completed:
+                    missing.remove(id)
+                    filled += 1
+                    if filled % 10 == 0:
+                        print(f"导演真实头像已保存到 Notion：{filled} 位")
+        if not missing:
+            break
+        print(f"导演头像第 {attempt + 1} 轮剩余 {len(missing)} 位")
+    saved = {page["id"]: page for page in helper.query_all(helper.director_database_id)}
+    unavailable = [
+        utils.get_property_value(saved[id]["properties"]["标题"])
+        for id in sorted(active)
+        if needs_director_portrait(saved[id].get("icon"))
+    ]
+    print(
+        json.dumps(
+            {
+                "导演头像核验": {
+                    "导演数": len(active),
+                    "有头像": len(active) - len(unavailable),
+                    "本次补齐": filled,
+                    "未取得头像": unavailable,
+                }
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
 def render_heatmap(interests, year):
     counts = Counter()
     for item in interests:
@@ -599,6 +708,7 @@ def main():
     sync_movies(helper, interests)
     sync_plan_posters(helper)
     sync_origin_metadata(helper)
+    sync_director_portraits(helper)
     sync_playlist_progress(helper)
     render_heatmap(interests, pendulum.now("Asia/Shanghai").year)
 
